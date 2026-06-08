@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -14,12 +15,27 @@ import typer
 
 from .common import emit, log
 
+# ── Pipe safety ───────────────────────────────────────────────────────────────
+# Prevent BrokenPipeError when downstream closes early (e.g. | head -1)
+try:
+    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+except AttributeError:
+    pass  # Windows has no SIGPIPE
+
 app = typer.Typer(help="Catalog, describe, and search your filesystem by purpose.")
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
 DEFAULT_DB = os.environ.get("FILE_CATALOG_DB", os.path.expanduser("~/.config/file-catalog/catalog.db"))
 SCAN_BATCH = 500  # commit every N files
+
+# Safe git environment — prevents hooks, prompts, and glob expansion
+_GIT_ENV = {
+    **os.environ,
+    "GIT_TERMINAL_PROMPT": "0",
+    "GIT_NOGLOB_PATHSPECS": "1",
+    "GIT_CONFIG_NOSYSTEM": "1",
+}
 
 
 def get_db(db_path: str = DEFAULT_DB) -> sqlite3.Connection:
@@ -43,7 +59,7 @@ def _ensure_schema(conn: sqlite3.Connection):
             size        INTEGER,
             extension   TEXT,
             purpose     TEXT,          -- inferred purpose
-            description TEXT,          -- manual description
+            description TEXT,          -- manual description (user-provided)
             language    TEXT,
             framework   TEXT,
             git_remote  TEXT,
@@ -141,6 +157,20 @@ FRAMEWORK_MARKERS = {
 }
 
 
+def _safe_git(cmd: list[str], cwd: str, timeout: int = 5) -> Optional[str]:
+    """Run a git command safely (no hooks, no prompts) and return stdout or None."""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            cwd=cwd, env=_GIT_ENV,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+    return None
+
+
 def infer_purpose(path: Path, is_dir: bool) -> dict:
     """Infer the purpose, language, and framework of a file or directory."""
     result = {"purpose": None, "language": None, "framework": None}
@@ -149,7 +179,7 @@ def infer_purpose(path: Path, is_dir: bool) -> dict:
         # Check for project markers in the directory
         try:
             children = {f.name for f in path.iterdir()}
-        except PermissionError:
+        except (PermissionError, OSError):
             return result
 
         for marker, desc in PROJECT_MARKERS.items():
@@ -163,47 +193,49 @@ def infer_purpose(path: Path, is_dir: bool) -> dict:
                 result["framework"] = fw
                 break
 
-        # Check for git remote
-        git_dir = path / ".git"
-        if git_dir.exists():
+        # Check for git remote — read .git/config directly instead of shelling out
+        git_config = path / ".git" / "config"
+        if git_config.exists():
             try:
-                remote = subprocess.run(
-                    ["git", "-C", str(path), "remote", "get-url", "origin"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if remote.returncode == 0:
-                    result["git_remote"] = remote.stdout.strip()
-            except (subprocess.TimeoutExpired, FileNotFoundError):
+                config_text = git_config.read_text(encoding="utf-8", errors="replace")
+                for line in config_text.split("\n"):
+                    line = line.strip()
+                    if line.startswith("url = ") and "github.com" in line:
+                        result["git_remote"] = line[6:].strip()
+                        break
+                    elif line.startswith("url = "):
+                        result["git_remote"] = line[6:].strip()
+            except (OSError, PermissionError):
                 pass
 
-        # Check for README
-        for readme in ("README.md", "README.rst", "README.txt", "README"):
-            readme_path = path / readme
-            if readme_path.exists():
-                try:
-                    content = readme_path.read_text(encoding="utf-8", errors="replace")[:500]
-                    # Extract first non-empty, non-heading line as description
-                    for line in content.split("\n"):
-                        line = line.strip()
-                        if line and not line.startswith("#") and not line.startswith("==="):
-                            result["purpose"] = line[:200]
-                            break
-                except (OSError, PermissionError):
-                    pass
-                break
+        # Check for README — only use as fallback if no marker found
+        if not result["purpose"]:
+            for readme in ("README.md", "README.rst", "README.txt", "README"):
+                readme_path = path / readme
+                if readme_path.exists():
+                    try:
+                        content = readme_path.read_text(encoding="utf-8", errors="replace")[:500]
+                        for line in content.split("\n"):
+                            line = line.strip()
+                            if line and not line.startswith("#") and not line.startswith("==="):
+                                result["purpose"] = line[:200]
+                                break
+                    except (OSError, PermissionError):
+                        pass
+                    break
 
         # Special directories
         name = path.name.lower()
         if name in ("src", "lib", "source"):
             result["purpose"] = result["purpose"] or "Source code directory"
         elif name in ("tests", "test", "__tests__"):
-            result["purpose"] = "Test directory"
+            result["purpose"] = result["purpose"] or "Test directory"
         elif name in ("docs", "doc", "documentation"):
-            result["purpose"] = "Documentation"
+            result["purpose"] = result["purpose"] or "Documentation"
         elif name in ("scripts", "bin", "tools"):
-            result["purpose"] = "Scripts/tools directory"
+            result["purpose"] = result["purpose"] or "Scripts/tools directory"
         elif name in ("config", "conf", "settings"):
-            result["purpose"] = "Configuration directory"
+            result["purpose"] = result["purpose"] or "Configuration directory"
         elif name in (".git", ".hg", ".svn"):
             result["purpose"] = "Version control"
         elif name in ("node_modules", ".venv", "venv", "env", "__pycache__", ".tox"):
@@ -254,24 +286,26 @@ def infer_purpose(path: Path, is_dir: bool) -> dict:
     return result
 
 
-def _scan_single(path: Path, parent: str) -> dict:
-    """Scan a single file/directory and return its record."""
+def _scan_entry(entry: os.DirEntry, parent: str) -> Optional[dict]:
+    """Scan a single DirEntry and return its record (uses cached stat)."""
     try:
-        stat = path.stat()
+        stat = entry.stat(follow_symlinks=False)
     except (OSError, PermissionError):
         return None
 
-    is_dir = path.is_dir()
+    is_dir = entry.is_dir(follow_symlinks=False)
+    path = Path(entry.path)
     info = infer_purpose(path, is_dir)
 
     return {
-        "path": str(path),
+        "path": str(path.resolve()),
         "parent": parent,
-        "name": path.name,
+        "name": entry.name,
         "type": "dir" if is_dir else "file",
         "size": stat.st_size if not is_dir else None,
         "extension": path.suffix.lower() if not is_dir else None,
         "purpose": info.get("purpose"),
+        "description": None,
         "language": info.get("language"),
         "framework": info.get("framework"),
         "git_remote": info.get("git_remote"),
@@ -308,6 +342,7 @@ def scan(
     dir_count = 0
     batch = []
     exclude_set = set(exclude)
+    visited: set[tuple[int, int]] = set()  # (dev, ino) for symlink cycle detection
 
     log(f"scanning {root_path} (depth={max_depth}, excluding {', '.join(exclude)})")
 
@@ -316,38 +351,53 @@ def scan(
         if depth > max_depth:
             return
 
+        # Symlink cycle detection
         try:
-            entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+            st = directory.stat()
+            key = (st.st_dev, st.st_ino)
+            if key in visited:
+                log(f"  symlink cycle detected: {directory}")
+                return
+            visited.add(key)
+        except (OSError, PermissionError):
+            return
+
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
         except PermissionError:
             log(f"  permission denied: {directory}")
             return
 
         for entry in entries:
-            if entry.name in exclude_set or entry.name.startswith("."):
-                # Still record hidden dirs and excluded dirs as single entries
-                if entry.is_dir() and entry.name in exclude_set:
-                    record = _scan_single(entry, str(directory))
-                    if record:
-                        record["purpose"] = f"Excluded directory ({entry.name})"
-                        batch.append(record)
-                        dir_count += 1
-                    continue
-                if entry.is_dir() and entry.name.startswith("."):
-                    record = _scan_single(entry, str(directory))
-                    if record:
-                        batch.append(record)
-                        dir_count += 1
-                    continue
+            name = entry.name
+
+            # Skip excluded directories (but catalog them as excluded)
+            if name in exclude_set and entry.is_dir(follow_symlinks=False):
+                record = _scan_entry(entry, str(directory))
+                if record:
+                    record["purpose"] = f"Excluded directory ({name})"
+                    batch.append(record)
+                    dir_count += 1
                 continue
 
-            record = _scan_single(entry, str(directory))
+            # Hidden directories: catalog but don't recurse (except well-known ones)
+            if name.startswith(".") and entry.is_dir(follow_symlinks=False):
+                record = _scan_entry(entry, str(directory))
+                if record:
+                    batch.append(record)
+                    dir_count += 1
+                # Don't recurse into hidden dirs (except .github, .vscode which are cataloged)
+                continue
+
+            # Hidden files: catalog them (they have purpose — .gitignore, .env, etc.)
+            record = _scan_entry(entry, str(directory))
             if record is None:
                 continue
 
             batch.append(record)
-            if entry.is_dir():
+            if entry.is_dir(follow_symlinks=False):
                 dir_count += 1
-                _walk(entry, depth + 1, str(entry))
+                _walk(Path(entry.path), depth + 1, str(Path(entry.path).resolve()))
             else:
                 file_count += 1
 
@@ -374,12 +424,13 @@ def scan(
 def _flush(conn: sqlite3.Connection, batch: list[dict]):
     """Upsert a batch of records into the files table."""
     conn.executemany("""
-        INSERT INTO files (path, parent, name, type, size, extension, purpose, language, framework, git_remote, last_modified, last_scanned)
-        VALUES (:path, :parent, :name, :type, :size, :extension, :purpose, :language, :framework, :git_remote, :last_modified, :last_scanned)
+        INSERT INTO files (path, parent, name, type, size, extension, purpose, description, language, framework, git_remote, last_modified, last_scanned)
+        VALUES (:path, :parent, :name, :type, :size, :extension, :purpose, :description, :language, :framework, :git_remote, :last_modified, :last_scanned)
         ON CONFLICT(path) DO UPDATE SET
             parent=excluded.parent, name=excluded.name, type=excluded.type,
             size=excluded.size, extension=excluded.extension,
             purpose=COALESCE(excluded.purpose, files.purpose),
+            description=COALESCE(files.description, excluded.description),
             language=excluded.language, framework=excluded.framework,
             git_remote=COALESCE(excluded.git_remote, files.git_remote),
             last_modified=excluded.last_modified, last_scanned=excluded.last_scanned
@@ -412,26 +463,16 @@ def describe(
     if record["type"] == "dir":
         p = Path(resolved)
         if (p / ".git").exists():
-            try:
-                log_result = subprocess.run(
-                    ["git", "-C", resolved, "log", "--oneline", "-5", "--format=%h %s (%ar)"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if log_result.returncode == 0 and log_result.stdout.strip():
-                    record["recent_commits"] = log_result.stdout.strip().split("\n")
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
+            commits = _safe_git(
+                ["git", "log", "--oneline", "-5", "--format=%h %s (%ar)"],
+                cwd=resolved,
+            )
+            if commits:
+                record["recent_commits"] = commits.split("\n")
 
-            try:
-                status = subprocess.run(
-                    ["git", "-C", resolved, "status", "--porcelain"],
-                    capture_output=True, text=True, timeout=5
-                )
-                if status.returncode == 0:
-                    changes = len(status.stdout.strip().split("\n")) if status.stdout.strip() else 0
-                    record["uncommitted_changes"] = changes
-            except (subprocess.TimeoutExpired, FileNotFoundError):
-                pass
+            status = _safe_git(["git", "status", "--porcelain"], cwd=resolved)
+            if status is not None:
+                record["uncommitted_changes"] = len(status.split("\n")) if status else 0
 
     # Clean up None values and float timestamps for display
     clean = {}
@@ -446,6 +487,11 @@ def describe(
     emit(clean)
 
 
+def _escape_like(s: str) -> str:
+    """Escape SQL LIKE special characters."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @app.command()
 def search(
     query: str = typer.Argument(help="Search term (matches name, purpose, description, tags)"),
@@ -455,21 +501,20 @@ def search(
 ):
     """Search the catalog by name, purpose, description, or tag."""
     conn = get_db(db)
-    pattern = f"%{query}%"
 
-    sql = """
-        SELECT f.path, f.name, f.type, f.purpose, f.description, f.language, f.framework
-        FROM files f
-        WHERE (f.name LIKE ? OR f.purpose LIKE ? OR f.description LIKE ?)
-    """
-    params = [pattern, pattern, pattern]
+    if type_filter and type_filter not in ("file", "dir"):
+        log(f"ERROR: --type must be 'file' or 'dir', got '{type_filter}'")
+        raise typer.Exit(code=1)
 
-    # Also search tags
+    escaped = _escape_like(query)
+    pattern = f"%{escaped}%"
+
     sql = """
         SELECT DISTINCT f.path, f.name, f.type, f.purpose, f.description, f.language, f.framework
         FROM files f
         LEFT JOIN tags t ON f.path = t.path
-        WHERE (f.name LIKE ? OR f.purpose LIKE ? OR f.description LIKE ? OR t.tag LIKE ?)
+        WHERE (f.name LIKE ? ESCAPE '\\' OR f.purpose LIKE ? ESCAPE '\\'
+               OR f.description LIKE ? ESCAPE '\\' OR t.tag LIKE ? ESCAPE '\\')
     """
     params = [pattern, pattern, pattern, pattern]
 
@@ -499,13 +544,16 @@ def summary(
     db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
     max_items: int = typer.Option(50, "--max", "-m", help="Max items to include"),
 ):
-    """Generate a text summary of a directory for LLM context."""
+    """Generate a plain-text summary of a directory for LLM context.
+
+    Note: output is plain text (not NDJSON) — intentionally designed for
+    piping to call-llm. Use 'describe' for structured JSON output.
+    """
     conn = get_db(db)
     resolved = str(Path(path).resolve())
 
-    # Get direct children
     rows = conn.execute("""
-        SELECT name, type, purpose, language, framework
+        SELECT name, type, purpose, language, framework, description
         FROM files WHERE parent = ?
         ORDER BY type DESC, name
         LIMIT ?
@@ -515,7 +563,6 @@ def summary(
         log(f"ERROR: '{path}' not in catalog or empty. Run 'file-catalog scan' first.")
         raise typer.Exit(code=1)
 
-    # Get stats
     stats = conn.execute("""
         SELECT
             COUNT(*) as total,
@@ -534,15 +581,18 @@ def summary(
     for row in rows:
         icon = "📁" if row["type"] == "dir" else "📄"
         parts = [f"{icon} {row['name']}"]
-        if row["purpose"]:
-            parts.append(f"— {row['purpose']}")
+        # Prefer manual description over inferred purpose
+        desc = row["description"] or row["purpose"]
+        if desc:
+            parts.append(f"— {desc}")
         if row["language"]:
             parts.append(f"[{row['language']}]")
         if row["framework"]:
             parts.append(f"({row['framework']})")
         lines.append(" ".join(parts))
 
-    print("\n".join(lines))
+    # Plain text to stdout — intentional for LLM pipeline (documented in docstring)
+    print("\n".join(lines), flush=True)
     log(f"summary: {len(rows)} items")
 
 
@@ -557,7 +607,6 @@ def tag(
     conn = get_db(db)
     resolved = str(Path(path).resolve())
 
-    # Ensure path exists in catalog
     exists = conn.execute("SELECT 1 FROM files WHERE path=?", (resolved,)).fetchone()
     if not exists:
         log(f"ERROR: '{path}' not in catalog. Run 'file-catalog scan' first.")
@@ -579,19 +628,26 @@ def tag(
 @app.command()
 def untitled(
     db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    type_filter: str = typer.Option("all", "--type", "-t", help="Filter: file, dir, or all"),
     limit: int = typer.Option(20, "--limit", "-n", help="Max results"),
 ):
-    """List files/dirs with no inferred purpose (candidates for manual tagging)."""
+    """List files and/or dirs with no inferred purpose (candidates for manual tagging)."""
     conn = get_db(db)
 
-    rows = conn.execute("""
-        SELECT path, name, type, extension, language
-        FROM files
-        WHERE purpose IS NULL AND type = 'dir'
-        ORDER BY path
-        LIMIT ?
-    """, (limit,)).fetchall()
+    sql = "SELECT path, name, type, extension, language FROM files WHERE purpose IS NULL"
+    params = []
 
+    if type_filter and type_filter != "all":
+        if type_filter not in ("file", "dir"):
+            log(f"ERROR: --type must be 'file', 'dir', or 'all', got '{type_filter}'")
+            raise typer.Exit(code=1)
+        sql += " AND type = ?"
+        params.append(type_filter)
+
+    sql += " ORDER BY path LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
 
     if not rows:
@@ -636,6 +692,7 @@ def stats(
     recent_scans = conn.execute("""
         SELECT root, started, finished, file_count, dir_count
         FROM scan_log
+        WHERE finished IS NOT NULL
         ORDER BY started DESC
         LIMIT 5
     """).fetchall()
@@ -669,66 +726,80 @@ def stats(
 def changes(
     db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
     limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
+    max_depth: int = typer.Option(3, "--depth", "-d", help="Max depth for detecting new files"),
     since: float = typer.Option(None, "--since", "-s", help="Unix timestamp to compare against (default: last scan)"),
 ):
     """Detect new, modified, or deleted files since the last scan."""
     conn = get_db(db)
 
     if since is None:
-        # Use the most recent scan time
-        row = conn.execute("SELECT MAX(started) as ts FROM scan_log").fetchone()
+        row = conn.execute("SELECT MAX(started) as ts FROM scan_log WHERE finished IS NOT NULL").fetchone()
         if not row or not row["ts"]:
-            log("ERROR: no scans recorded. Run 'file-catalog scan' first.")
+            log("ERROR: no completed scans recorded. Run 'file-catalog scan' first.")
             raise typer.Exit(code=1)
         since = row["ts"]
 
     since_dt = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
     log(f"checking changes since {since_dt}")
 
-    # Check for modified files (mtime > last_scanned)
-    modified = conn.execute("""
-        SELECT path, name, type, last_modified, last_scanned
+    # Modified files (mtime > last_scanned)
+    modified = []
+    for r in conn.execute("""
+        SELECT path, name, type, last_modified
         FROM files
         WHERE last_modified > ? AND type = 'file'
         ORDER BY last_modified DESC
         LIMIT ?
-    """, (since, limit)).fetchall()
+    """, (since, limit)).fetchall():
+        modified.append({
+            "path": r["path"], "name": r["name"], "type": r["type"],
+            "last_modified": datetime.fromtimestamp(r["last_modified"], tz=timezone.utc).isoformat(),
+        })
 
-    # Check for new files on disk not in catalog
+    # Batch-load known paths for each root into a set (avoids N+1 queries)
     new_files = []
     deleted_files = []
 
-    # Check top-level scan roots for new/deleted
-    roots = conn.execute("SELECT DISTINCT root FROM scan_log").fetchall()
+    roots = conn.execute("SELECT DISTINCT root FROM scan_log WHERE finished IS NOT NULL").fetchall()
     for root_row in roots:
         root_path = Path(root_row["root"])
         if not root_path.exists():
             continue
 
-        # Walk and find files not in catalog
-        try:
-            for entry in root_path.rglob("*"):
-                if len(new_files) >= limit:
-                    break
-                resolved = str(entry.resolve())
-                exists = conn.execute("SELECT 1 FROM files WHERE path=?", (resolved,)).fetchone()
-                if not exists and entry.exists():
-                    try:
-                        stat = entry.stat()
-                        new_files.append({
-                            "path": resolved,
-                            "name": entry.name,
-                            "type": "dir" if entry.is_dir() else "file",
-                            "last_modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                        })
-                    except (OSError, PermissionError):
-                        pass
-        except PermissionError:
-            pass
+        # Load known paths for this root
+        known_paths: set[str] = set()
+        for row in conn.execute("SELECT path FROM files WHERE path LIKE ?", (f"{root_path}%",)):
+            known_paths.add(row["path"])
 
-    # Check for deleted files (in catalog but not on disk)
-    all_files = conn.execute("SELECT path FROM files ORDER BY path").fetchall()
-    for row in all_files:
+        # Walk with depth limit and find new files
+        def _check_new(directory: Path, depth: int):
+            if depth > max_depth or len(new_files) >= limit:
+                return
+            try:
+                for entry in os.scandir(directory):
+                    if len(new_files) >= limit:
+                        break
+                    resolved = str(Path(entry.path).resolve())
+                    if resolved not in known_paths:
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            new_files.append({
+                                "path": resolved,
+                                "name": entry.name,
+                                "type": "dir" if entry.is_dir(follow_symlinks=False) else "file",
+                                "last_modified": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+                            })
+                        except (OSError, PermissionError):
+                            pass
+                        if entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                            _check_new(Path(entry.path), depth + 1)
+            except PermissionError:
+                pass
+
+        _check_new(root_path, 0)
+
+    # Check for deleted files — stream, don't load all at once
+    for row in conn.execute("SELECT path FROM files ORDER BY path"):
         if len(deleted_files) >= limit:
             break
         if not Path(row["path"]).exists():
@@ -742,21 +813,10 @@ def changes(
         "new_count": len(new_files),
         "deleted_count": len(deleted_files),
     }
-
     if modified:
-        result["modified"] = [
-            {
-                "path": r["path"],
-                "name": r["name"],
-                "type": r["type"],
-                "last_modified": datetime.fromtimestamp(r["last_modified"], tz=timezone.utc).isoformat(),
-            }
-            for r in modified
-        ]
-
+        result["modified"] = modified[:limit]
     if new_files:
         result["new"] = new_files[:limit]
-
     if deleted_files:
         result["deleted"] = deleted_files[:limit]
 
@@ -774,16 +834,20 @@ def prompt_missing(
     """Generate a prompt about items without purpose — for cron or manual tagging."""
     conn = get_db(db)
 
+    if type_filter not in ("file", "dir", "all"):
+        log(f"ERROR: --type must be 'file', 'dir', or 'all', got '{type_filter}'")
+        raise typer.Exit(code=1)
+
     sql = "SELECT path, name, type, extension, language, parent FROM files WHERE purpose IS NULL"
     params = []
 
-    if type_filter and type_filter != "all":
+    if type_filter != "all":
         sql += " AND type = ?"
         params.append(type_filter)
 
     if focus:
-        sql += " AND path LIKE ?"
-        params.append(f"{focus}%")
+        sql += " AND path LIKE ? ESCAPE '\\'"
+        params.append(f"{_escape_like(focus)}%")
 
     sql += " ORDER BY RANDOM() LIMIT ?"
     params.append(count)
@@ -795,7 +859,6 @@ def prompt_missing(
         emit({"status": "all_described", "message": "Everything has a purpose!"})
         return
 
-    # Build a prompt that can be sent to the user or an LLM
     items = []
     for r in rows:
         item = {"path": r["path"], "name": r["name"], "type": r["type"]}
@@ -836,27 +899,45 @@ def prompt_missing(
 @app.command()
 def apply_descriptions(
     db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Preview changes without applying"),
 ):
-    """Read NDJSON descriptions from stdin and apply them.
+    """Read NDJSON descriptions from stdin and apply them to the description column.
 
     Expected format: {"path": "/full/path", "description": "what it is"}
-    One per line.
+    One per line. Preserves auto-inferred purpose; description is separate.
     """
     from .common import read_stdin_ndjson
 
     conn = get_db(db)
     count = 0
+    skipped = 0
 
     for record in read_stdin_ndjson():
         path = record.get("path")
         desc = record.get("description")
-        if path and desc:
+        if not path or not desc:
+            skipped += 1
+            continue
+
+        # Verify path exists in catalog
+        exists = conn.execute("SELECT 1 FROM files WHERE path=?", (path,)).fetchone()
+        if not exists:
+            log(f"WARNING: '{path}' not in catalog, skipping")
+            skipped += 1
+            continue
+
+        if dry_run:
+            log(f"  would set description: {path} → {desc}")
+        else:
             conn.execute(
-                "UPDATE files SET purpose=? WHERE path=?",
+                "UPDATE files SET description=? WHERE path=?",
                 (desc, path)
             )
-            count += 1
+        count += 1
 
-    conn.commit()
+    if not dry_run:
+        conn.commit()
     conn.close()
-    log(f"applied {count} description(s)")
+
+    action = "would apply" if dry_run else "applied"
+    log(f"{action} {count} description(s), {skipped} skipped")
