@@ -1,0 +1,19 @@
+[project]
+name = "ai-cli-toolkit"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+read-sql = "ai_cli_toolkit.read_sql:app"
+build-prompt = "ai_cli_toolkit.build_prompt:app"
+call-llm = "ai_cli_toolkit.call_llm:app"
+review-code = "ai_cli_toolkit.review_code:app"
+extract-field = "ai_cli_toolkit.extract_field:app"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
