@@ -13,6 +13,7 @@ build-prompt = "ai_cli_toolkit.build_prompt:app"
 call-llm = "ai_cli_toolkit.call_llm:app"
 review-code = "ai_cli_toolkit.review_code:app"
 extract-field = "ai_cli_toolkit.extract_field:app"
+file-catalog = "ai_cli_toolkit.file_catalog:app"
 
 [build-system]
 requires = ["setuptools>=68.0"]
