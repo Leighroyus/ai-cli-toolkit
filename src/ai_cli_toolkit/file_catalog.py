@@ -663,3 +663,200 @@ def stats(
         ],
     }
     emit(record)
+
+
+@app.command()
+def changes(
+    db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    limit: int = typer.Option(50, "--limit", "-n", help="Max results"),
+    since: float = typer.Option(None, "--since", "-s", help="Unix timestamp to compare against (default: last scan)"),
+):
+    """Detect new, modified, or deleted files since the last scan."""
+    conn = get_db(db)
+
+    if since is None:
+        # Use the most recent scan time
+        row = conn.execute("SELECT MAX(started) as ts FROM scan_log").fetchone()
+        if not row or not row["ts"]:
+            log("ERROR: no scans recorded. Run 'file-catalog scan' first.")
+            raise typer.Exit(code=1)
+        since = row["ts"]
+
+    since_dt = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
+    log(f"checking changes since {since_dt}")
+
+    # Check for modified files (mtime > last_scanned)
+    modified = conn.execute("""
+        SELECT path, name, type, last_modified, last_scanned
+        FROM files
+        WHERE last_modified > ? AND type = 'file'
+        ORDER BY last_modified DESC
+        LIMIT ?
+    """, (since, limit)).fetchall()
+
+    # Check for new files on disk not in catalog
+    new_files = []
+    deleted_files = []
+
+    # Check top-level scan roots for new/deleted
+    roots = conn.execute("SELECT DISTINCT root FROM scan_log").fetchall()
+    for root_row in roots:
+        root_path = Path(root_row["root"])
+        if not root_path.exists():
+            continue
+
+        # Walk and find files not in catalog
+        try:
+            for entry in root_path.rglob("*"):
+                if len(new_files) >= limit:
+                    break
+                resolved = str(entry.resolve())
+                exists = conn.execute("SELECT 1 FROM files WHERE path=?", (resolved,)).fetchone()
+                if not exists and entry.exists():
+                    try:
+                        stat = entry.stat()
+                        new_files.append({
+                            "path": resolved,
+                            "name": entry.name,
+                            "type": "dir" if entry.is_dir() else "file",
+                            "last_modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                        })
+                    except (OSError, PermissionError):
+                        pass
+        except PermissionError:
+            pass
+
+    # Check for deleted files (in catalog but not on disk)
+    all_files = conn.execute("SELECT path FROM files ORDER BY path").fetchall()
+    for row in all_files:
+        if len(deleted_files) >= limit:
+            break
+        if not Path(row["path"]).exists():
+            deleted_files.append({"path": row["path"]})
+
+    conn.close()
+
+    result = {
+        "since": since_dt,
+        "modified_count": len(modified),
+        "new_count": len(new_files),
+        "deleted_count": len(deleted_files),
+    }
+
+    if modified:
+        result["modified"] = [
+            {
+                "path": r["path"],
+                "name": r["name"],
+                "type": r["type"],
+                "last_modified": datetime.fromtimestamp(r["last_modified"], tz=timezone.utc).isoformat(),
+            }
+            for r in modified
+        ]
+
+    if new_files:
+        result["new"] = new_files[:limit]
+
+    if deleted_files:
+        result["deleted"] = deleted_files[:limit]
+
+    emit(result)
+    log(f"changes: {len(modified)} modified, {len(new_files)} new, {len(deleted_files)} deleted")
+
+
+@app.command()
+def prompt_missing(
+    db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    count: int = typer.Option(10, "--count", "-n", help="Number of items to include"),
+    type_filter: str = typer.Option("dir", "--type", "-t", help="Filter: file, dir, or all"),
+    focus: str = typer.Option(None, "--focus", "-f", help="Filter by parent path prefix"),
+):
+    """Generate a prompt about items without purpose — for cron or manual tagging."""
+    conn = get_db(db)
+
+    sql = "SELECT path, name, type, extension, language, parent FROM files WHERE purpose IS NULL"
+    params = []
+
+    if type_filter and type_filter != "all":
+        sql += " AND type = ?"
+        params.append(type_filter)
+
+    if focus:
+        sql += " AND path LIKE ?"
+        params.append(f"{focus}%")
+
+    sql += " ORDER BY RANDOM() LIMIT ?"
+    params.append(count)
+
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    if not rows:
+        emit({"status": "all_described", "message": "Everything has a purpose!"})
+        return
+
+    # Build a prompt that can be sent to the user or an LLM
+    items = []
+    for r in rows:
+        item = {"path": r["path"], "name": r["name"], "type": r["type"]}
+        if r["extension"]:
+            item["extension"] = r["extension"]
+        if r["language"]:
+            item["language"] = r["language"]
+        items.append(item)
+
+    prompt_lines = [
+        f"I found {len(items)} items without a description in the file catalog.",
+        "Can you tell me what each one is for?",
+        "",
+    ]
+    for i, item in enumerate(items, 1):
+        icon = "📁" if item["type"] == "dir" else "📄"
+        line = f"{i}. {icon} {item['path']}"
+        if item.get("language"):
+            line += f" [{item['language']}]"
+        prompt_lines.append(line)
+
+    prompt_lines.append("")
+    prompt_lines.append("Reply with descriptions like:")
+    prompt_lines.append("  1. ASX stock portfolio tracker")
+    prompt_lines.append("  2. Old backup directory — can delete")
+    prompt_lines.append("")
+    prompt_lines.append("Or say 'skip' to skip this batch.")
+
+    emit({
+        "status": "needs_input",
+        "count": len(items),
+        "items": items,
+        "prompt": "\n".join(prompt_lines),
+    })
+    log(f"generated prompt for {len(items)} untagged items")
+
+
+@app.command()
+def apply_descriptions(
+    db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+):
+    """Read NDJSON descriptions from stdin and apply them.
+
+    Expected format: {"path": "/full/path", "description": "what it is"}
+    One per line.
+    """
+    from .common import read_stdin_ndjson
+
+    conn = get_db(db)
+    count = 0
+
+    for record in read_stdin_ndjson():
+        path = record.get("path")
+        desc = record.get("description")
+        if path and desc:
+            conn.execute(
+                "UPDATE files SET purpose=? WHERE path=?",
+                (desc, path)
+            )
+            count += 1
+
+    conn.commit()
+    conn.close()
+    log(f"applied {count} description(s)")
