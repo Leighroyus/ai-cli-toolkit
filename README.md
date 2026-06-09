@@ -117,10 +117,35 @@ Reports missing field counts to stderr. Prints empty string (not "None") for mis
 
 Filesystem context awareness tool. Catalog, describe, and search your files by purpose.
 
+#### Scanning
+
 ```bash
-# Scan a directory tree
+# Basic scan
 file-catalog scan ~/projects --depth 4
 
+# Auto-detect profile (code vs personal)
+file-catalog scan ~ --profile auto
+
+# Deep scan: content sampling, metadata extraction, fingerprinting
+file-catalog scan ~ --deep
+
+# Exclude directories
+file-catalog scan ~ -x node_modules -x .cache -x snap
+```
+
+**Scan profiles:**
+- `code` — optimised for software projects (markers, frameworks, git)
+- `personal` — optimised for user files (media, documents, year archives)
+- `auto` — detects based on directory contents (default)
+
+**`--deep` flag enables:**
+- Content sampling (shebangs, docstrings, imports, API patterns)
+- Media metadata extraction (EXIF from photos, ID3 from audio, PDF metadata)
+- Duplicate fingerprinting (size + blake2b hash of first 4KB)
+
+#### Querying
+
+```bash
 # Describe a specific path
 file-catalog describe ~/projects/my-app
 
@@ -130,33 +155,50 @@ file-catalog search "portfolio tracker"
 # Generate a text summary for LLM context
 file-catalog summary ~/projects | call-llm -s "What projects do I have?"
 
-# Add manual tags
-file-catalog tag ~/projects/my-app "production" "api"
+# Find duplicate files (requires --deep scan)
+file-catalog duplicates
 
 # Check for new/modified/deleted files
 file-catalog changes
 
-# Get items without purpose (for tagging)
+# Show stats
+file-catalog stats
+```
+
+#### Tagging & Enrichment
+
+```bash
+# Add manual tags
+file-catalog tag ~/projects/my-app "production" "api"
+
+# Get items without purpose
 file-catalog prompt-missing --count 5
+
+# Auto-enrich via LLM
+file-catalog enrich --count 10
 
 # Apply descriptions from NDJSON
 echo '{"path":"/dir","description":"old backups"}' | file-catalog apply-descriptions
 
 # Preview without applying
 file-catalog prompt-missing | call-llm | file-catalog apply-descriptions --dry-run
-
-# Show stats
-file-catalog stats
 ```
 
-**Options (scan):**
-- `--depth, -d` — Max directory depth (default: 5)
-- `--exclude, -x` — Directory names to exclude (repeatable, defaults: node_modules, __pycache__, .git, etc.)
-- `--db` — Catalog database path (default: `~/.config/file-catalog/catalog.db`)
+**Purpose inference from:**
+- README files (first non-heading line)
+- Package manifests (pyproject.toml, package.json, Cargo.toml, go.mod, etc.)
+- Git remotes (read from .git/config directly)
+- File extensions → language/framework mapping
+- Framework markers (Django, Flask, Next.js, Vue, Angular, etc.)
+- Directory names (src, tests, docs, scripts, config, etc.)
+- Well-known paths (~/.ssh, ~/Downloads, ~/Documents, etc.)
+- Filename patterns (test_*.py, *.spec.ts, *.migration, *.lock, etc.)
+- Personal directory patterns (year archives, tax, photos, events, etc.)
+- Media types (photos, video, audio, ebooks, fonts, design files)
+- Content sampling with `--deep` (shebangs, docstrings, imports, API patterns)
+- Media metadata with `--deep` (EXIF, ID3, PDF metadata)
 
-**Purpose inference from:** README files, package manifests (pyproject.toml, package.json, Cargo.toml, etc.), git remotes, file extensions, framework markers (Django, Flask, Next.js, etc.), directory names.
-
-**Features:** FTS5 full-text search, symlink cycle detection, safe git environment (no hooks/prompts), schema migration, manual tagging, change detection, cron-ready missing-descriptions prompts.
+**Database:** `~/.config/file-catalog/catalog.db` (override with `FILE_CATALOG_DB` env var)
 
 ## Example Pipelines
 
@@ -193,9 +235,17 @@ echo "Explain the tradeoffs of SCD Type 2 vs Type 1" \
 ### File catalog + LLM
 
 ```bash
+# Summarise projects
 file-catalog summary ~/clawd/projects | call-llm -s "Summarise my active projects"
 
-file-catalog search "python" | jq -r '.purpose' | sort -u
+# Search and filter
+file-catalog search "python" | jq '.purpose' | sort -u
+
+# Auto-enrich missing descriptions
+file-catalog enrich --count 10 --confirm
+
+# Find duplicates
+file-catalog duplicates | jq '.size_mb * .count' -s 'add'
 ```
 
 ## Configuration
