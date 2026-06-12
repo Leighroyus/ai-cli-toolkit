@@ -163,7 +163,37 @@ file-catalog changes
 
 # Show stats
 file-catalog stats
+
+# Disk usage breakdown by directory
+file-catalog du ~/projects --depth 2
+
+# Only show files untouched for 90+ days
+file-catalog du ~ --stale 90 --depth 1
+
+# Sort by file count instead of size
+file-catalog du ~ --sort files --limit 15
+
+# Cleanup suggestions (dry run — nothing deleted by default)
+file-catalog clean --stale 60 --min-size 50
+
+# Actually delete to trash (safe — recoverable)
+file-catalog clean --stale 90 --min-size 100 --delete
+
+# Permanent delete (use with caution)
+file-catalog clean --stale 365 --min-size 200 --delete --permanent
 ```
+
+#### Cleanup Categories
+
+`file-catalog clean` checks five categories:
+
+1. **Stale files** — large files not modified in N days
+2. **Duplicates** — files with identical content fingerprints
+3. **Old downloads** — files sitting in ~/Downloads
+4. **Backup directories** — dirs with "backup" in the path
+5. **Cache/temp** — `__pycache__`, `node_modules`, `.venv`, etc.
+
+Options: `--downloads/--no-downloads`, `--backups/--no-backups`, `--cache/--no-cache`
 
 #### Tagging & Enrichment
 
@@ -246,6 +276,12 @@ file-catalog enrich --count 10 --confirm
 
 # Find duplicates
 file-catalog duplicates | jq '.size_mb * .count' -s 'add'
+
+# Disk usage — biggest dirs untouched for 90+ days
+file-catalog du ~ --stale 90 --depth 1 --limit 10
+
+# Cleanup suggestions — pipe to LLM for prioritisation
+file-catalog clean --stale 60 --min-size 100 | call-llm -s "Prioritise these cleanup targets by safety and impact"
 ```
 
 ## Configuration
@@ -296,3 +332,4 @@ echo "hello" | llm -m openrouter/xiaomi/mimo-v2.5-pro
 - [ ] `diff-reviews` — send code to two models, diff their feedback
 - [ ] Thin orchestrator for multi-step pipelines with error handling
 - [ ] `file-catalog watch` — filesystem watcher for real-time change detection
+- [ ] `file-catalog changes` — detect deletions (currently only detects new/modified)

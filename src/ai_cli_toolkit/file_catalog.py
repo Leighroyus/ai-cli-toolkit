@@ -1350,6 +1350,327 @@ def stats(
     emit(record)
 
 
+def _fmt_size(size_bytes: int) -> str:
+    """Format bytes as human-readable size."""
+    if size_bytes >= 1024 ** 3:
+        return f"{size_bytes / 1024 ** 3:.1f} GB"
+    elif size_bytes >= 1024 ** 2:
+        return f"{size_bytes / 1024 ** 2:.1f} MB"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    return f"{size_bytes} B"
+
+
+@app.command()
+def du(
+    path: Optional[str] = typer.Argument(None, help="Root path to summarize (default: all)"),
+    db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    limit: int = typer.Option(20, "--limit", "-n", help="Max directories to show"),
+    depth: int = typer.Option(1, "--depth", "-d", help="Directory depth to summarize (1=top-level)"),
+    sort_by: str = typer.Option("size", "--sort", "-s", help="Sort by: size, files, or name"),
+    stale_days: int = typer.Option(0, "--stale", help="Only show files not modified in N days (0=disabled)"),
+):
+    """Show disk usage breakdown by directory (like 'du -sh')."""
+    conn = get_db(db)
+    try:
+        # Build the WHERE clause
+        where = "type='file' AND size IS NOT NULL"
+        params: list = []
+        if path:
+            where += " AND (path LIKE ? OR path = ?)"
+            params.extend([f"{path.rstrip('/')}/%", path.rstrip("/")])
+        if stale_days > 0:
+            cutoff = time.time() - (stale_days * 86400)
+            where += " AND last_modified IS NOT NULL AND last_modified < ?"
+            params.append(cutoff)
+
+        # Get top-level aggregation
+        # Extract the Nth parent directory component for grouping
+        # We group by the parent at the requested depth
+        rows = conn.execute(f"""
+            SELECT parent, SUM(size) as total_size, COUNT(*) as file_count
+            FROM files
+            WHERE {where}
+            GROUP BY parent
+        """, params).fetchall()
+
+        # Roll up to requested depth
+        prefix = path.rstrip("/") if path else ""
+        buckets: dict[str, dict] = {}
+        for row in rows:
+            p = row["parent"]
+            # Strip common prefix
+            if prefix and p.startswith(prefix):
+                rel = p[len(prefix):].lstrip("/")
+            elif prefix:
+                continue
+            else:
+                rel = p.lstrip("/")
+
+            # Take first N components
+            parts = [x for x in rel.split("/") if x]
+            if len(parts) >= depth:
+                key = "/".join(parts[:depth])
+            else:
+                key = rel or "/"
+
+            if key not in buckets:
+                buckets[key] = {"size": 0, "files": 0}
+            buckets[key]["size"] += row["total_size"]
+            buckets[key]["files"] += row["file_count"]
+
+        # Also get directory count per bucket
+        dir_params: list = []
+        dir_where = "type='dir' AND size IS NULL"
+        if path:
+            dir_where += " AND (parent LIKE ? OR parent = ?)"
+            dir_params.extend([f"{path.rstrip('/')}/%", path.rstrip("/")])
+        dir_rows = conn.execute(f"""
+            SELECT parent, COUNT(*) as dir_count
+            FROM files
+            WHERE {dir_where}
+        """, dir_params).fetchall()
+
+        dir_buckets: dict[str, int] = {}
+        for row in dir_rows:
+            p = row["parent"]
+            if prefix and p.startswith(prefix):
+                rel = p[len(prefix):].lstrip("/")
+            elif prefix:
+                continue
+            else:
+                rel = p.lstrip("/")
+            parts = [x for x in rel.split("/") if x]
+            if len(parts) >= depth:
+                key = "/".join(parts[:depth])
+            else:
+                key = rel or "/"
+            dir_buckets[key] = dir_buckets.get(key, 0) + row["dir_count"]
+
+        # Merge and sort
+        results = []
+        for key, info in buckets.items():
+            results.append({
+                "path": f"{prefix}/{key}" if prefix and key != "/" else f"/{key}" if key != "/" else prefix or "/",
+                "size_bytes": info["size"],
+                "size_human": _fmt_size(info["size"]),
+                "files": info["files"],
+                "dirs": dir_buckets.get(key, 0),
+            })
+
+        reverse = sort_by != "name"
+        if sort_by == "files":
+            results.sort(key=lambda x: x["files"], reverse=reverse)
+        elif sort_by == "name":
+            results.sort(key=lambda x: x["path"])
+        else:
+            results.sort(key=lambda x: x["size_bytes"], reverse=reverse)
+
+        results = results[:limit]
+
+        for r in results:
+            emit(r)
+
+        total_size = sum(b["size"] for b in buckets.values())
+        total_files = sum(b["files"] for b in buckets.values())
+        log(f"total: {_fmt_size(total_size)} across {total_files} files in {len(buckets)} directories")
+
+    finally:
+        conn.close()
+
+
+@app.command()
+def clean(
+    dry_run: bool = typer.Option(True, "--dry-run/--delete", help="Dry run mode: only list targets (default). Use --delete to actually remove."),
+    db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
+    min_size_mb: float = typer.Option(10, "--min-size", help="Minimum size in MB to consider"),
+    stale_days: int = typer.Option(30, "--stale", help="Flag files not modified in N days"),
+    limit: int = typer.Option(30, "--limit", "-n", help="Max suggestions to show"),
+    include_downloads: bool = typer.Option(True, "--downloads/--no-downloads", help="Include Downloads directory"),
+    include_backups: bool = typer.Option(True, "--backups/--no-backups", help="Include backup directories"),
+    include_cache: bool = typer.Option(True, "--cache/--no-cache", help="Include cache/temp directories"),
+    trash: bool = typer.Option(True, "--trash/--permanent", help="Move to trash (safe) vs permanent delete"),
+):
+    """Suggest cleanup targets based on size, age, and type. Dry run by default — nothing deleted unless --delete is passed."""
+    conn = get_db(db)
+    try:
+        now = time.time()
+        cutoff = now - (stale_days * 86400)
+        min_bytes = int(min_size_mb * 1024 * 1024)
+        suggestions: list[dict] = []
+
+        # 1. Large stale files
+        rows = conn.execute("""
+            SELECT path, size, last_modified, description
+            FROM files
+            WHERE type='file' AND size >= ? AND last_modified IS NOT NULL AND last_modified < ?
+            ORDER BY size DESC
+            LIMIT ?
+        """, (min_bytes, cutoff, limit)).fetchall()
+        for r in rows:
+            age_days = int((now - r["last_modified"]) / 86400)
+            suggestions.append({
+                "path": r["path"],
+                "size_bytes": r["size"],
+                "size_human": _fmt_size(r["size"]),
+                "age_days": age_days,
+                "reason": f"Not modified in {age_days} days",
+                "category": "stale",
+                "description": r["description"],
+            })
+
+        # 2. Duplicate files (largest groups)
+        if len(suggestions) < limit:
+            dupes = conn.execute("""
+                SELECT fingerprint, GROUP_CONCAT(path) as paths, COUNT(*) as cnt, MAX(size) as size
+                FROM files
+                WHERE fingerprint IS NOT NULL AND size >= ?
+                GROUP BY fingerprint
+                HAVING cnt > 1
+                ORDER BY size DESC
+                LIMIT ?
+            """, (min_bytes, limit - len(suggestions))).fetchall()
+            for d in dupes:
+                paths = d["paths"].split(",")
+                suggestions.append({
+                    "path": paths[0],
+                    "size_bytes": d["size"] * (d["cnt"] - 1),
+                    "size_human": _fmt_size(d["size"] * (d["cnt"] - 1)),
+                    "age_days": 0,
+                    "reason": f"{d['cnt']} copies ({_fmt_size(d['size'])} each)",
+                    "category": "duplicates",
+                    "description": f"Keep 1, trash {d['cnt'] - 1} copies",
+                })
+
+        # 3. Downloads directory - old large files
+        if include_downloads and len(suggestions) < limit:
+            dl_rows = conn.execute("""
+                SELECT path, size, last_modified, description
+                FROM files
+                WHERE type='file' AND size >= ? AND path LIKE ?
+                AND (last_modified IS NULL OR last_modified < ?)
+                ORDER BY size DESC
+                LIMIT ?
+            """, (min_bytes, "/home/leigh/Downloads/%", cutoff, limit - len(suggestions))).fetchall()
+            for r in dl_rows:
+                age_days = int((now - r["last_modified"]) / 86400) if r["last_modified"] else -1
+                suggestions.append({
+                    "path": r["path"],
+                    "size_bytes": r["size"],
+                    "size_human": _fmt_size(r["size"]),
+                    "age_days": age_days,
+                    "reason": f"Old download ({age_days}d)" if age_days >= 0 else "Old download (unknown age)",
+                    "category": "downloads",
+                    "description": r["description"],
+                })
+
+        # 4. Backup directories
+        if include_backups and len(suggestions) < limit:
+            bk_rows = conn.execute("""
+                SELECT parent as path, SUM(size) as total_size, COUNT(*) as cnt,
+                       MIN(last_modified) as oldest, MAX(last_modified) as newest
+                FROM files
+                WHERE type='file' AND (parent LIKE '%backup%' OR parent LIKE '%Backup%' OR parent LIKE '%bak%')
+                GROUP BY parent
+                HAVING total_size >= ?
+                ORDER BY total_size DESC
+                LIMIT ?
+            """, (min_bytes, limit - len(suggestions))).fetchall()
+            for r in bk_rows:
+                age_days = int((now - r["oldest"]) / 86400) if r["oldest"] else -1
+                suggestions.append({
+                    "path": r["path"],
+                    "size_bytes": r["total_size"],
+                    "size_human": _fmt_size(r["total_size"]),
+                    "age_days": age_days,
+                    "reason": f"Backup dir ({r['cnt']} files, {age_days}d old)" if age_days >= 0 else f"Backup dir ({r['cnt']} files)",
+                    "category": "backups",
+                    "description": None,
+                })
+
+        # 5. Cache/temp directories
+        if include_cache and len(suggestions) < limit:
+            cache_rows = conn.execute("""
+                SELECT parent as path, SUM(size) as total_size, COUNT(*) as cnt
+                FROM files
+                WHERE type='file' AND (
+                    parent LIKE '%/__pycache__%' OR parent LIKE '%/cache/%'
+                    OR parent LIKE '%/.cache/%' OR parent LIKE '%/tmp/%'
+                    OR parent LIKE '%/node_modules/%' OR parent LIKE '%/.venv/%'
+                )
+                GROUP BY parent
+                HAVING total_size >= ?
+                ORDER BY total_size DESC
+                LIMIT ?
+            """, (min_bytes, limit - len(suggestions))).fetchall()
+            for r in cache_rows:
+                suggestions.append({
+                    "path": r["path"],
+                    "size_bytes": r["total_size"],
+                    "size_human": _fmt_size(r["total_size"]),
+                    "age_days": 0,
+                    "reason": f"Cache/temp ({r['cnt']} files)",
+                    "category": "cache",
+                    "description": None,
+                })
+
+        # Deduplicate by path
+        seen = set()
+        unique = []
+        for s in suggestions:
+            if s["path"] not in seen:
+                seen.add(s["path"])
+                unique.append(s)
+        suggestions = unique[:limit]
+
+        # Sort by potential savings
+        suggestions.sort(key=lambda x: x["size_bytes"], reverse=True)
+
+        # Output suggestions
+        for s in suggestions:
+            emit(s)
+
+        total_savings = sum(s["size_bytes"] for s in suggestions)
+
+        # If --delete is passed, actually delete/trash the files
+        if not dry_run and suggestions:
+            deleted = 0
+            freed = 0
+            for s in suggestions:
+                p = s["path"]
+                if not os.path.exists(p):
+                    continue
+                try:
+                    if trash:
+                        result = subprocess.run(["gio", "trash", p], capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            deleted += 1
+                            freed += s["size_bytes"]
+                            log(f"trashed: {p}")
+                        else:
+                            log(f"failed to trash {p}: {result.stderr.strip()}")
+                    else:
+                        if os.path.isdir(p):
+                            import shutil
+                            shutil.rmtree(p)
+                        else:
+                            os.remove(p)
+                        deleted += 1
+                        freed += s["size_bytes"]
+                        log(f"deleted: {p}")
+                except Exception as e:
+                    log(f"error: {p}: {e}")
+
+            log(f"{'trashed' if trash else 'deleted'} {deleted} item(s), freed {_fmt_size(freed)}")
+        else:
+            log(f"{len(suggestions)} suggestion(s), potential savings: {_fmt_size(total_savings)}")
+            if suggestions and dry_run:
+                log("dry run — pass --delete to actually remove (moves to trash by default)")
+
+    finally:
+        conn.close()
+
+
 @app.command()
 def duplicates(
     db: str = typer.Option(DEFAULT_DB, "--db", help="Catalog database path"),
